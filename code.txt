@@ -1,0 +1,687 @@
+####scRNA pip#########
+#please in R
+Sys.setenv(LANGUAGE = "en")
+options(stringsAsFactors = FALSE)
+library(data.table)
+library(ggplot2)
+library(tricycle)   
+library(scattermore)
+library(scater)
+library(Seurat)
+library(harmony)
+library(dplyr)
+library(tidyverse)
+library(patchwork)
+library(SingleR)
+library(monocle)
+library(ggsci)
+library(ggthemes)
+library(tidydr)
+library(ggrepel)
+library(DoubletFinder)
+library(readr)
+library(plyr)
+library(ggpubr)
+library(UCell)
+library(irGSEA)
+library(SCENIC)
+library(AUCell)
+sample_color <- c("#4DBBD5FF","#E64B35FF","#00A087FF","#3C5488FF", "#F39B7FFF","#8491B4FF",
+                  "#91D1C2FF","#DC0000FF","#7E6148FF","#BC3C29FF","#0072B5FF","#E18727FF","#D24B27","#D51F26","#272E6A")
+samples=list.files('/home/data')
+samples 
+sceList = lapply(samples,function(pro){ 
+  folder=file.path('/home/data',pro) 
+  print(pro)
+  print(folder)
+  print(list.files(folder))
+  sce=CreateSeuratObject(counts = Read10X(folder),
+                         project =  pro )
+  return(sce)
+})
+names(sceList) =  samples
+samples
+sce.all <- merge(sceList[[1]], y= sceList[ -1 ] ,
+                 add.cell.ids=samples )
+mito_genes=rownames(sce.all)[grep("^MT-", rownames(sce.all))] 
+mito_genes 
+sce.all=PercentageFeatureSet(sce.all, "^MT-", col.name = "percent_mito")
+fivenum(sce.all@meta.data$percent_mito)
+ribo_genes=rownames(sce.all)[grep("^RP[SL]", rownames(sce.all),ignore.case = T)]
+ribo_genes
+sce.all=PercentageFeatureSet(sce.all, "^RP[SL]", col.name = "percent_ribo")
+fivenum(sce.all@meta.data$percent_ribo)
+selected_c <- WhichCells(sce.all, expression = nFeature_RNA > 200)
+selected_f <- rownames(sce.all)[Matrix::rowSums(sce.all@assays$RNA@counts > 0 ) > 3]
+sce.all.filt <- subset(sce.all, features = selected_f, cells = selected_c)
+selected_mito <- WhichCells(sce.all.filt, expression = percent_mito < 30)
+selected_ribo <- WhichCells(sce.all.filt, expression = percent_ribo > 3)
+length(selected_ribo)
+length(selected_mito)
+sce.all.filt <- subset(sce.all.filt, cells = selected_mito)
+sce.all.filt <- subset(sce.all.filt, cells = selected_ribo)
+feats <- c("nFeature_RNA", "nCount_RNA","percent_mito", "percent_ribo", "percent_hb")
+VlnPlot(sce.all.filt, group.by = "sample", features = feats,
+        pt.size = 0, ncol = 4,cols =sample_color) + 
+  NoLegend()
+FeatureScatter(sce.all.filt, "nCount_RNA", "nFeature_RNA", group.by = "sample", pt.size = 0.5)+ ggsci::scale_color_npg()
+FeatureScatter(sce.all.filt, "percent_mito", "nFeature_RNA", group.by = "sample", pt.size = 0.5)+ ggsci::scale_color_npg()
+dim(sce.all.filt)
+af <- sce.all.filt
+af.sce = as.SingleCellExperiment(sce.all.filt)
+af.sce <- project_cycle_space(af.sce,
+                              species = c("human"), 
+                              gname.type = "SYMBOL")
+scater::plotReducedDim(af.sce, dimred = "tricycleEmbedding") +
+  labs(x = "Projected PC1", y = "Projected PC2") +
+  ggtitle(sprintf("Projected cell cycle space (n=%d)",
+                  ncol(af.sce))) +
+  theme_bw(base_size = 14)
+af.sce <- estimate_cycle_position(af.sce)
+af.sce <- estimate_Schwabe_stage(af.sce,
+                                 gname.type = 'SYMBOL',
+                                 species = 'human')
+scater::plotReducedDim(af.sce, dimred = "tricycleEmbedding",
+                       colour_by = "CCStage") +
+  labs(x = "Projected PC1", y = "Projected PC2",
+       title = paste0("Projected cell cycle space (n=", ncol(af.sce), ")")) +
+  theme_bw(base_size = 14)
+table(af.sce$CCStage)
+pdf(file = "07-cell_cycle_density.pdf",width =8,height = 6)
+plot_ccposition_den(af.sce$tricyclePosition,
+                    af.sce$orig.ident, 'sample', type = "circular",
+                    bw = 10,  fig.title = "Density of cell cycle (\u03b8)") +
+  theme_bw(base_size = 14)
+dev.off()
+scRNA_harmony<-sce.all.filt
+DefaultAssay(scRNA_harmony) <- 'RNA'
+scRNA_harmony <- NormalizeData(scRNA_harmony) %>% FindVariableFeatures() %>% ScaleData() %>% RunPCA(verbose=FALSE)
+system.time({scRNA_harmony <- RunHarmony(scRNA_harmony, group.by.vars = "sample")})
+scRNA_harmony <- FindNeighbors(scRNA_harmony, reduction = "harmony", dims = 1:20) %>% FindClusters(resolution = 0.2)
+scRNA_harmony <- RunUMAP(scRNA_harmony, reduction = "harmony", dims = 1:30)
+scRNA_harmony <- RunTSNE(scRNA_harmony, reduction = "harmony", dims = 1:30)
+DimPlot(scRNA_harmony, reduction = "tsne", label = F,label.size=5)+NoAxes()
+colnames(scRNA_harmony@meta.data)
+sc_mono <- subset(scRNA_harmony,idents = 'Monocytes')
+rm(scRNA_harmony)
+table(sc_mono@meta.data$orig.ident)
+sc_mono@meta.data$orig.ident2 <- ''
+sc_mono@meta.data$orig.ident2[which(sc_mono@meta.data$orig.ident %in% c('Mo1','Mo2','Mo3'))] <- 'healthy'
+sc_mono@meta.data$orig.ident2[which(sc_mono@meta.data$orig.ident %in% c('OPMo1','OPMo2','OPMo3'))] <- 'patient'
+table(sc_mono@meta.data$orig.ident2)
+sc_mono@meta.data$orig.ident2 <- factor(sc_mono@meta.data$orig.ident2)
+Idents(sc_mono) <- "orig.ident2" 
+mono.deg=FindMarkers(sc_mono,ident.1 = "patient",ident.2 = "healthy")
+avg.mono <- log1p(AverageExpression(sc_mono, verbose = FALSE)$RNA)
+avg.mono = as.data.frame(avg.mono)
+avg.mono$gene <- rownames(avg.mono)
+ggplot(avg.mono, aes(healthy,patient))+
+  xlim(0,5.5)+ylim(0,5.5)+ 
+  geom_point(size=.8,col = '#587DF7')+
+  theme_bw()+
+  annotate('segment',x = 0,y = 0,xend = 5.5,yend = 5.5,linetype = 2)+
+  theme(axis.title = element_text(size=20),
+        axis.text = element_text(size = 15))
+sce <- scRNA_harmony
+for (res in c(0.1,0.2,0.3, 0.4, 0.5, 0.6, 0.7, 0.8,0.9,1)) {
+  print(res)
+  sce <- FindClusters(sce, graph.name = "RNA_snn", resolution = res, algorithm = 1)
+}
+cluster_umap <- plot_grid(ncol = 4, 
+                          DimPlot(sce, reduction = "umap", group.by = "RNA_snn_res.0.1", label = T) & NoAxes(), 
+                          DimPlot(sce, reduction = "umap", group.by = "RNA_snn_res.0.2", label = T)& NoAxes(),
+                          DimPlot(sce, reduction = "umap", group.by = "RNA_snn_res.0.3", label = T) & NoAxes(), 
+                          DimPlot(sce, reduction = "umap", group.by = "RNA_snn_res.0.4", label = T)& NoAxes(),
+                          DimPlot(sce, reduction = "umap", group.by = "RNA_snn_res.0.5", label = T) & NoAxes(),
+                          DimPlot(sce, reduction = "umap", group.by = "RNA_snn_res.0.6", label = T)& NoAxes(),
+                          DimPlot(sce, reduction = "umap", group.by = "RNA_snn_res.0.7", label = T)& NoAxes(),
+                          DimPlot(sce, reduction = "umap", group.by = "RNA_snn_res.0.8", label = T) & NoAxes(),
+                          DimPlot(sce, reduction = "umap", group.by = "RNA_snn_res.0.9", label = T) & NoAxes(), 
+                          DimPlot(sce, reduction = "umap", group.by = "RNA_snn_res.1", label = T) & NoAxes()
+)
+cluster_umap
+
+sweep.res.list <- paramSweep_v3(sce, PCs = pc.num, sct = T)
+sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE) 
+bcmvn <- find.pK(sweep.stats)
+pK_bcmvn <- as.numeric(bcmvn$pK[which.max(bcmvn$BCmetric)])
+DoubletRate = 0.039  
+homotypic.prop <- modelHomotypic(sce$seurat_clusters) 
+nExp_poi <- round(DoubletRate*ncol(sce))
+nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+sce <- doubletFinder_v3(sce, PCs = pc.num, pN = 0.25, pK = pK_bcmvn,
+                        nExp = nExp_poi.adj, reuse.pANN = F, sct = T)
+
+load('unsortann.Rdata')
+gene <- c('CXCL12','IGFBP5','CFD','FRZB','LEPR', 'COL3A1', 'SLUG',	'COL14A1', 
+          'NKG7',	'GZMA',	'CST7',		'PRF1',	'KLRD1',	'GNLY',	'GZMH',	'FGFBP2',	'CTSW',
+          'CD19', 'CD22', 'CD79A', 'CD79B', 'IGD', 'IGHM',
+          'C1QA','C1QB','C1QC',
+          'CD3E','CD3D','CD3G',
+          'A100A9', 'FCN1', 'LGALS2',  'S100A12', 'S100A8', 
+          'CCDC50', 'CLE4C', 'IRF7', 'IRF8', 'LILRA4', 
+          'PLD4', 'PPP1R14B',  'TCF4',
+          'HIST1H4C','STMN1','HMGB2','UBE2C','PRTN3','MPO','ELANE','AZU1',
+          'CTSG','CA1','AHSP','HBM','HBD','HBA1','SPP1','IBSP','COL1A1','SPARC','COL1A2','ALAS2',
+          'SLC25A37','HBA2','HBB','PF4','SDPR','TUBB1','PPBP','GNG11'
+          
+)
+pdf(file="annheatmap.pdf",width = 6,height =9)
+Idents(sce) <- 'celltype'
+col1 <- c("#D51F26","#272E6A","#208A42","#89288F","#F47D2B","#FEE500","#8A9FD1","#C06CAB","#E6C2DC",
+          "#90D5E4","#89C75F","#F37B7D","#9983BD")
+AverageHeatmap(object = sce,  assays = "RNA",group.by = 'celltype',fontsize =7,annoCol = TRUE,
+               myanCol = col1 ,
+               markerGene =gene,row_title = "Marker genes", showRowNames = T,clusterAnnoName = F,
+               htCol = c("#1B19197F",'#8081807F',"#E18727FF"))   #负到正
+dev.off()
+######monocle2#########
+trace('project2MST', edit = T, where = asNamespace("monocle")) 
+data <- as(as.matrix(sce@assays$RNA@counts), 'sparseMatrix')
+pd <- new('AnnotatedDataFrame', data = sce@meta.data)
+fData <- data.frame(gene_short_name = row.names(data), row.names = row.names(data))
+fd <- new('AnnotatedDataFrame', data = fData)
+monocle_cds <- newCellDataSet(data,
+                              phenoData = pd,
+                              featureData = fd,
+                              lowerDetectionLimit = 0.01,
+                              expressionFamily = negbinomial.size())
+monocle_cds <- estimateSizeFactors(monocle_cds)
+monocle_cds <- estimateDispersions(monocle_cds)
+monocle_cds <- detectGenes(monocle_cds, min_expr = 1)
+HSMM=monocle_cds
+disp_table <- dispersionTable(HSMM)
+disp.genes <- subset(disp_table, mean_expression >= 0.1 & dispersion_empirical >= 1 * dispersion_fit)$gene_id
+HSMM <- setOrderingFilter(HSMM, disp.genes)
+plot_ordering_genes(HSMM)
+HSMM <- reduceDimension(HSMM,max_components = 2,reduction_method = 'DDRTree')
+HSMM <- orderCells(HSMM)
+plot_cell_trajectory(HSMM, color_by = "State",cell_name_size = 5,cell_size=1)+scale_colour_manual(values =sample_color )
+plot_cell_trajectory(HSMM, color_by = "Pseudotime",cell_size=1)
+mono.info <- pData(mycds)
+head(mono.info)
+colnames(mono.info)
+cds <- HSMM
+pbmc <- sce
+groups=subset(pData(cds),select='State')
+pbmc=AddMetaData(object=pbmc, metadata=groups, col.name="cellstate")
+Idents(pbmc) <- "cellstate"
+sce <- pbmc
+pbmc.markers <- FindAllMarkers(object = sce,
+                               only.pos = T,
+                               min.pct = 0.3,
+                               logfc.threshold =0.3
+)
+pdf(file = 'DEGs.pdf',height = 15,width = 9)
+jjVolcano(diffData = data_forplot,
+          log2FC.cutoff = 0.25,
+          aesCol = c("#272E6A","#D51F26"),
+          topGeneN = 10,
+          tile.col =c("#E64B35FF","#4DBBD5FF","#00A087FF","#3C5488FF",
+                      "#F39B7FFF","#8491B4FF", "#91D1C2FF","#DC0000FF") ,
+          size  = 2,  fontface = 'italic',
+          flip = F, 
+          polar =T, 
+)+ylim(-8,8)
+dev.off()
+markerVocalno(markers =gene,log2FC=1,
+              topn =5,
+              labelCol =col1)
+
+VlnPlot(sce, assay='RNA',group.by='State_mono.info', pt.size = 0,col=sample_color,
+        features =c('FCGR3A'))
+
+scRNA1 <- sce 
+scRNA1$celltype <- sce$State_mono.info
+x=scRNA1@meta.data$celltype
+table(x)
+pB2_df <- table(scRNA1@meta.data$celltype,scRNA1@meta.data$orig.ident) %>% melt()
+colnames(pB2_df) <- c("celltype","Sample","Number")
+cluster=c('1','2','3','4','5','6','7')
+pB2_df$celltype <- factor(pB2_df$celltype,levels = cluster)
+pB4 <- ggplot(data = pB2_df, aes(x =Number, y = Sample, fill =  celltype)) +
+  geom_bar(stat = "identity", width=0.8,position="fill")+
+  scale_fill_manual(values=sample_color) +
+  theme_bw()+
+  theme(panel.grid =element_blank()) +
+  labs(x="Ratio",y="Sample")+
+  theme(axis.text.y = element_text(size=12, colour = "black"))+
+  theme(axis.text.x = element_text(size=12, colour = "black"))
+pB4
+scRNA1 <- sce 
+scRNA1$celltype <- sce$State_mono.info
+x=scRNA1@meta.data$celltype
+table(x)
+pB2_df <- table(scRNA1@meta.data$celltype,scRNA1@meta.data$sample) %>% melt()
+colnames(pB2_df) <- c("celltype","Sample","Number")
+cluster=c('1','2','3','4','5','6','7')
+pB2_df$celltype <- factor(pB2_df$celltype,levels = cluster)
+pB4 <- ggplot(data = pB2_df, aes(x =Number, y = Sample, fill =  celltype)) +
+  geom_bar(stat = "identity", width=0.8,position="fill")+
+  scale_fill_manual(values=sample_color) +
+  theme_bw()+
+  theme(panel.grid =element_blank()) +
+  labs(x="Ratio",y="Sample")+
+  theme(axis.text.y = element_text(size=12, colour = "black"))+
+  theme(axis.text.x = element_text(size=12, colour = "black"))
+pB4
+########irGSEA##########
+Idents(sce) <- sce$State_mono.info
+sce<- irGSEA.score(object = sce, assay = "RNA",
+                   slot = "data", seeds = 123, ncores =25,
+                   min.cells = 3, min.feature = 0,
+                   custom = F, geneset = NULL, msigdb = T,
+                   species = "Homo sapiens", category = "H",  
+                   subcategory = NULL, geneid = "symbol",
+                   method = c(   "AUCell" 
+                   ),
+                   aucell.MaxRank = NULL, ucell.MaxRank = 3000,
+                   kcdf = 'Gaussian')
+Seurat::Assays(sce)
+result.dge <- irGSEA.integrate(object = sce,
+                               group.by = "State_mono.info",
+                               metadata = NULL, col.name = NULL,
+                               method = c("AUCell"))
+sample_color <- c("#E64B35FF","#4DBBD5FF","#00A087FF","#3C5488FF", "#F39B7FFF","#8491B4FF",
+                  "#91D1C2FF","#DC0000FF","#7E6148FF","#BC3C29FF","#0072B5FF","#E18727FF","#D24B27","#D51F26","#272E6A")
+dd <- result.dge[["AUCell"]]
+dd <- subset(dd,p_val_adj<0.05)
+set <- dd$Name
+irGSEA.bubble.plot <- irGSEA.bubble(object = result.dge,method = "AUCell",
+                                    show.geneset =set ,
+                                    cluster.color=sample_color,
+)
+pdf(file='GSEA.pdf', width=8, height=9)
+print(irGSEA.bubble.plot)
+dev.off()
+
+########AUCell#######
+cells_rankings <- AUCell_buildRankings(sce@assays$RNA@data,  nCores=40, plotStats=TRUE,,splitByBlocks=TRUE) 
+cells_rankings
+c2 <- read.gmt("state.gmt") 
+geneSets <- lapply(unique(c2$term), function(x){print(x);c2$gene[c2$term == x]})
+names(geneSets) <- unique(c2$term)
+cells_AUC <- AUCell_calcAUC(geneSets, cells_rankings,nCores =40, aucMaxRank=nrow(cells_rankings)*0.2)
+dir.create("./hallAUCELL")
+setwd("./hallAUCELL")
+saveRDS(cells_AUC,'hallAUCELL.rds')
+pathway.show.all=cells_AUC@NAMES
+lapply(1:length(pathway.show.all), function(i){
+  geneSet <- pathway.show.all[i]
+  aucs <- as.numeric(getAUC(cells_AUC)[geneSet, ])
+  sc2$AUC <- aucs
+  df<- data.frame(sce@meta.data, sce@reductions$umap@cell.embeddings)
+  class_avg <- df %>%
+    group_by( orig.ident) %>%
+    summarise(
+      tSNE_1 = median(TSNE_1),
+      tSNE_2 = median(TSNE_2)
+    )
+  ggplot(df, aes(TSNE_1, TSNE_2))  +
+    geom_point(aes(colour  = AUC), size=0.5) + viridis::scale_color_viridis(option="B") +   
+    theme(legend.position = "none") + theme_bw()+theme(panel.grid=element_blank())+ggtitle(geneSet)#+ggtitle(geneSet)+facet_grid(.~group)
+  ggsave(paste0(gsub("/","_",pathway.show.all[i]),".pdf"),width =5,height =4)
+})
+########BayesPrism#########
+sc_dataset<- t(as(as.matrix(sce@assays$RNA@counts), 'sparseMatrix'))
+sc.dat <- as.matrix(sc_dataset)
+cell.type.labels <- sce$celltype
+cell.state.labels <- sce$sub
+names(cell.type.labels) <- colnames(sce)
+names(cell.state.labels) <- colnames(sce)
+plot.cor.phi (input=sc.dat,
+              input.labels=cell.state.labels,
+              title="cell state correlation",my_palette= colorRampPalette(c(rep("#4DBBD5FF",2), "white", rep("#E64B35FF",2)))(50),
+              cexRow=0.2, cexCol=0.2,
+              margins=c(2,2))
+
+plot.cor.phi (input=sc.dat, 
+              input.labels=cell.type.labels, 
+              title="cell type correlation",my_palette= colorRampPalette(c(rep("#4DBBD5FF",2), "white", rep("#E64B35FF",2)))(50),
+              cexRow=0.5, cexCol=0.5,
+)
+
+sc.stat <- plot.scRNA.outlier(
+  input=sc.dat,
+  cell.type.labels=cell.type.labels,
+  species="hs", 
+  return.raw=TRUE 
+)
+bk.stat <- plot.bulk.outlier(
+  bulk.input=bk.dat,
+  sc.input=sc.dat, 
+  cell.type.labels=cell.type.labels,
+  species="hs", 
+  return.raw=TRUE
+)
+head(bk.stat)
+sc.dat.filtered <- cleanup.genes (input=sc.dat,
+                                  input.type="count.matrix",
+                                  species="hs", 
+                                  gene.group=c( "Rb","Mrp","other_Rb","chrM","MALAT1","chrX","chrY") ,
+                                  exp.cells=5)
+dim(sc.dat.filtered)
+plot.bulk.vs.sc (sc.input = sc.dat.filtered,
+                 bulk.input = bk.dat
+                 
+)
+sc.dat.filtered.pc <-  select.gene.type (sc.dat.filtered,
+                                         gene.type = "protein_coding")
+myPrism <- new.prism(
+  reference=sc.dat.filtered.pc,   
+  mixture=bk.dat,
+  input.type="count.matrix", 
+  cell.type.labels = cell.type.labels, 
+  cell.state.labels = cell.state.labels,
+  key=NULL,
+  outlier.cut=0.01,
+  outlier.fraction=0.1,
+)
+saveRDS(myPrism,'myPrism.rds')
+bp.res <- run.prism(prism = myPrism, n.cores=35)
+saveRDS(bp.res,'bp.res.rds')
+saveRDS(sce,'sceBayesPrism.rds')
+theta <- get.fraction (bp=bp.res,
+                       which.theta="final",
+                       state.or.type="state")
+
+######cellchat#######
+data.input <- GetAssayData(sce, assay = "RNA", slot = "data")
+identity <- subset(sce@meta.data, select =c("celltype") )
+cellchat <- createCellChat(object = data.input, meta = identity,  group.by = "celltype")
+CellChatDB <- CellChatDB.human
+showDatabaseCategory(CellChatDB)
+colnames(CellChatDB$interaction)
+CellChatDB$interaction[1:4,1:4]
+head(CellChatDB$cofactor)
+head(CellChatDB$complex)
+head(CellChatDB$geneInfo)
+unique(CellChatDB$interaction$annotation)
+cellchat@DB <- CellChatDB
+cellchat <- subsetData(cellchat)
+future::plan("multiprocess", workers =35)
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+cellchat <- projectData(cellchat, PPI.human)
+cellchat <- computeCommunProb(cellchat, raw.use = TRUE)
+cellchat <- filterCommunication(cellchat, min.cells = 3)
+df.net <- subsetCommunication(cellchat)
+saveRDS(df.net,'df.net.rds')
+write.csv(df.net,'df.net.csv')
+levels(cellchat@idents)  
+cellchat <- computeCommunProbPathway(cellchat)
+head(cellchat@net)
+head(cellchat@netP)
+cellchat <- aggregateNet(cellchat)
+saveRDS(cellchat,'cellchat.rds')
+#######scenic######
+exprMat <- as.matrix(sce@assays$RNA@counts)
+mydbDIR <- "/home/SCENICref"
+mydbs <- c( "hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.feather","hg38__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.feather")
+names(mydbs) <- c("10kb","500bp")
+scenicOptions <- initializeScenic(org="hgnc",  
+                                  nCores=30,
+                                  dbDir=mydbDIR, 
+                                  dbs = mydbs,
+                                  datasetTitle = "os")
+saveRDS(scenicOptions, "int/scenicOptions.rds")
+genesKept <- geneFiltering(exprMat, scenicOptions, 
+                           minCountsPerGene = 3 * 0.01 * ncol(exprMat), 
+                           minSamples = ncol(exprMat) * 0.01)
+exprMat_filtered <- exprMat[genesKept, ]
+runCorrelation(exprMat_filtered, scenicOptions)
+exprMat_filtered_log <- log2(exprMat_filtered+1)
+runGenie3(exprMat_filtered_log, scenicOptions, nParts = 20)
+head("int/1.4_GENIE3_linkList.Rds")
+head(readRDS("int/1.4_GENIE3_linkList.Rds") )
+scenicOptions@settings$verbose <- TRUE
+scenicOptions@settings$nCores <-35
+scenicOptions@settings$seed <- 123
+scenicOptions <- runSCENIC_1_coexNetwork2modules(scenicOptions) 
+scenicOptions <- runSCENIC_2_createRegulons(scenicOptions) 
+mydbDIR <- "/home/SCENICref"
+mydbs <- c( "hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.feather","hg38__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.feather")
+names(mydbs) <- c("10kb","500bp")
+scenicOptions <- initializeScenic(org="hgnc", 
+                                  nCores=35,
+                                  dbDir=mydbDIR, 
+                                  dbs = mydbs,
+                                  datasetTitle = "os")
+library(foreach)
+exprMat_all <- as.matrix(sce@assays$RNA@counts)
+exprMat_all <- log2(exprMat_all+1)
+runSCENIC_3_scoreCells(scenicOptions, exprMat=exprMat_all)
+runSCENIC_4_aucell_binarize(scenicOptions, exprMat=exprMat_all) 
+saveRDS(scenicOptions, "scenicOptions4.rds")
+#######scMetabolism########
+library(scMetabolism)
+library(ggplot2)
+library(rsvd)
+countexp.Seurat<-sc.metabolism.Seurat(obj = sce, method = "ssGSEA", imputation = F, ncores = 30, metabolism.type = "KEGG")
+saveRDS(countexp.Seurat,'scMetabolism.Seurat.rds')
+DotPlot.metabolism(obj = countexp.Seurat, pathway = input.pathway,norm = "y")
+#######Ucell#########
+library(UCell)
+metabolism <- read.gmt("signature.gmt") 
+unique(metabolism$term)
+osteoclast <- subset(metabolism, term=="osteoclast")
+osteoclast <- list(osteoclast$gene)
+names(osteoclast)[1] <- 'osteoclast'
+DefaultAssay(sce) <- 'RNA'
+metabolism_score <- AddModuleScore_UCell(sce,
+                                         features=osteoclast,
+                                         name="_score")
+####RNAscv#######
+#please in python
+import scvelo as scv
+import pandas as pd
+import numpy as np
+import os
+loom_data = scv.read('/home/combined.loom', cache=False)
+loom_data.obs
+loom_data.obs = loom_data.obs.rename(index = lambda x: x.replace('ZCDYY2_DOQFE:', 'ZCDYY2_').replace('L1EHF0500840_CNYTF:', 'L1EHF0500840_').replace('ZCDYY1_MKAZG:', 'ZCDYY1_').replace('HZXSF_9EM9Y:', 'HZXSF_').replace('sample2_6VOGY:', 'sample2_'))
+loom_data.obs.head()
+loom_data.obs = loom_data.obs.rename(index = lambda x: x.replace('x', '-1'))
+loom_data.obs.head()
+meta_path = "/home/rna_velocity"
+sample_obs = pd.read_csv(os.path.join(meta_path, "cellID_obs.csv"))
+cell_umap= pd.read_csv(os.path.join(meta_path, "cell_embeddings.csv"), header=0, names=["CellID", "UMAP_1", "UMAP_2"])
+cell_clusters = pd.read_csv(os.path.join(meta_path, "cell_clusters.csv"), header=0, names=["CellID", "cluster"])
+cell_celltype = pd.read_csv(os.path.join(meta_path, "cell_celltype.csv"), header=0, names=["CellID", "celltype"])
+sample_one = loom_data[np.isin(loom_data.obs.index, sample_obs)]
+sample_one.obs.head()
+sample_one_index = pd.DataFrame(sample_one.obs.index)
+sample_one_index = sample_one_index.rename(columns = {0:'Cell ID'})
+umap_ordered = sample_one_index.merge(cell_umap, on = "CellID")
+umap_ordered.head()
+celltype_ordered = sample_one_index.merge(cell_celltype, on = "CellID")
+celltype_ordered.head()
+clusters_ordered = sample_one_index.merge(cell_clusters, on = "CellID")
+clusters_ordered.head()
+umap_ordered = umap_ordered.iloc[:,1:]
+clusters_ordered = clusters_ordered.iloc[:,1:]
+celltype_ordered = celltype_ordered.iloc[:,1:]
+sample_one.obsm['X_umap'] = umap_ordered.values
+sample_one.uns['clusters'] = clusters_ordered.values
+sample_one.obs['celltype'] = celltype_ordered.values
+adata = sample_one
+adata.var_names_make_unique()
+new_directory = "/home/rna_velocity"
+os.chdir(new_directory)
+adata.write('scv.h5ad', compression = 'gzip')
+adata= scv.read('scv.h5ad')
+scv.settings.set_figure_params('scvelo')
+scv.set_figure_params()
+scv.pp.filter_and_normalize(adata)
+scv.pp.moments(adata)
+scv.tl.velocity(adata, mode = "stochastic")
+scv.tl.velocity_graph(adata)
+scv.pl.velocity_embedding_stream(adata, basis='X_umap',color = ['celltype','initial_size_spliced'], 
+                                 size = 20,alpha =0.8, legend_fontsize = 9, show=True, title='',save="scvl1.pdf"
+)
+
+
+######bulkpip######
+#please in  R
+library(pROC)
+library(ggplot2)
+library(GSVA)
+library(limma)
+library(GSEABase)
+library(ggpubr)
+expFile="GSE56815.txt"   
+gmtFile="signature.gmt"    
+rt=read.table(expFile, header=T, sep="\t", check.names=F)
+rt=as.matrix(rt)
+rownames(rt)=rt[,1]
+exp=rt[,2:ncol(rt)]
+dimnames=list(rownames(exp),colnames(exp))
+mat=matrix(as.numeric(as.matrix(exp)),nrow=nrow(exp),dimnames=dimnames)
+mat=avereps(mat)
+mat=normalizeBetweenArrays(mat)
+mat=mat[rowMeans(mat)>0,]
+
+geneSet=getGmt(gmtFile, geneIdType=SymbolIdentifier())
+
+ssgseaScore=gsva(mat, geneSet, method='ssgsea', kcdf='Gaussian', abs.ranking=TRUE)
+normalize=function(x){
+  return((x-min(x))/(max(x)-min(x)))}
+ssgseaOut=normalize(ssgseaScore)
+ssgseaOut=rbind(id=colnames(ssgseaOut),ssgseaOut)
+write.table(ssgseaOut, file="ssgseaOut.txt", sep="\t", quote=F, col.names=F)
+
+C="con"
+afcol="#E18727FF"
+hub="state.txt"  
+expfile="ssgseaOut.txt"  
+exp=read.table(expfile,sep = "\t",header = F,check.names = F)
+exp=t(exp)
+colnames(exp)=exp[1,]
+exp=exp[2:nrow(exp),]
+colnames(exp)[1]="ID"
+cli=read.table("sample.txt",sep = "\t",header = F,check.names = F)        
+cli[,2]=ifelse(cli[,2]==C,0,1)
+colnames(cli)=c("ID","P")
+af=merge(cli,exp,by = "ID")
+af[,3:ncol(af)]=lapply(af[,3:ncol(af)],as.numeric)
+genes=read.table(hub,sep = " ",header = F,check.names = F)[,1]
+genes=intersect(colnames(af),genes)
+par(mfrow=c(3,3)) 
+for (i in c(genes)) {
+  for (j in c("P")) {              
+    afroc=roc(af[,j],af[,i])
+    print(paste0(auc(afroc),"_",i,"_",j))
+    plot(afroc, print.auc=TRUE, auc.polygon=TRUE,axes=FALSE, grid.col=c("green", "red"), max.auc.polygon=TRUE,auc.polygon.col=afcol, print.thres=F,main=i)
+    
+  }
+}
+tmp=read.table('ssGSEA.txt', header=T, sep="\t", check.names=F,row.names = 1)
+head(tmp)
+tmp[,1:7] <- scale(tmp[1:7])
+p <- t.test(tmp[which(tmp$group =='highBMD' ),"state1"],tmp[which(tmp$group == "lowBMD"),"state1"])$p.value
+jco <- c("#EEB849","#1CB8B2")
+pdf(file='ssGSEAstate1.pdf', width=3, height=3,onefile = F)
+ggplot(data = tmp,aes(x = group, y = state1, fill = group))+
+  scale_fill_manual(values = jco[2:1]) + 
+  geom_boxplot(notch = F, outlier.size = -1, 
+               color="black", lwd=0.8, alpha = 0.7)+ 
+  geom_point(shape = 21, size=2, 
+             position = position_jitterdodge(), 
+             color="black", alpha=1)+ 
+  theme_bw() +theme(panel.grid = element_blank(),  axis.text.x = element_text(size = 13),
+                    ,  axis.text.y = element_text(size = 13))+
+  ylab(expression("Z-score for state1")) +
+  xlab("")  +
+  annotate(geom="text", cex=3,
+           x=1.5, y=3.5, 
+           label=paste0("P ", "= ",p), 
+           color="black") + 
+  theme( axis.ticks = element_line(size=0.2,color="black"),
+         axis.ticks.length = unit(0.2,"cm"),
+         legend.position = "none",
+         axis.title = element_text(size = 12),
+         axis.text = element_text(size = 10))
+dev.off()
+p <- t.test(tmp[which(tmp$group =='highBMD' ),"state7"],tmp[which(tmp$group == "lowBMD"),"state7"])$p.value
+pdf(file='ssGSEAstate7.pdf', width=3, height=3,onefile = F)
+ggplot(data = tmp,aes(x = group, y = state7, fill = group))+
+  scale_fill_manual(values = jco[2:1]) + 
+  geom_boxplot(notch = F, outlier.size = -1, 
+               color="black", lwd=0.8, alpha = 0.7)+
+  geom_point(shape = 21, size=2, 
+             position = position_jitterdodge(), 
+             color="black", alpha=1)+
+  theme_bw() +theme(panel.grid = element_blank(),  axis.text.x = element_text(size = 13),
+                    ,  axis.text.y = element_text(size = 13))+
+  ylab(expression("Z-score for state7")) +
+  xlab("")  +
+  annotate(geom="text", cex=3,
+           x=1.5, y=3.5,
+           label=paste0("P ", "= ",p),
+           color="black") + 
+  theme(
+    axis.ticks = element_line(size=0.2,color="black"),
+    axis.ticks.length = unit(0.2,"cm"),
+    legend.position = "none",
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10))
+dev.off()
+
+
+
+
+library(ggplot2)
+library(ggpubr)
+tmp=read.table('BayesPrism.txt', header=T, sep="\t", check.names=F,row.names = 1)
+head(tmp)
+tmp[,1:7] <- scale(tmp[1:7])
+p <- t.test(tmp[which(tmp$group =='highBMD' ),"state1"],tmp[which(tmp$group == "lowBMD"),"state1"])$p.value
+jco <- c("#E64B35FF","#4DBBD5FF")
+pdf(file='BayesPrismstate1.pdf', width=3, height=3,onefile = F)
+ggplot(data = tmp,aes(x = group, y = state1, fill = group))+
+  scale_fill_manual(values = jco[2:1]) + 
+  geom_boxplot(notch = F, outlier.size = -1, 
+               color="black", lwd=0.8, alpha = 0.7)+ 
+  geom_point(shape = 21, size=2, 
+             position = position_jitterdodge(), 
+             color="black", alpha=1)+
+  theme_bw() +theme(panel.grid = element_blank(),  axis.text.x = element_text(size = 13),
+                    ,  axis.text.y = element_text(size = 13))+
+  ylab(expression("Z-score for state1")) +
+  xlab("")  +
+  annotate(geom="text", cex=3,
+           x=1.5, y=3.5,
+           label=paste0("P ", "= ",p), 
+           color="black") + 
+  theme( axis.ticks = element_line(size=0.2,color="black"),
+         axis.ticks.length = unit(0.2,"cm"),
+         legend.position = "none",
+         axis.title = element_text(size = 12),
+         axis.text = element_text(size = 10))
+dev.off()
+p <- t.test(tmp[which(tmp$group =='highBMD' ),"state7"],tmp[which(tmp$group == "lowBMD"),"state7"])$p.value
+pdf(file='BayesPrismstate7.pdf', width=3, height=3,onefile = F)
+ggplot(data = tmp,aes(x = group, y = state7, fill = group))+
+  scale_fill_manual(values = jco[2:1]) + 
+  geom_boxplot(notch = F, outlier.size = -1, 
+               color="black", lwd=0.8, alpha = 0.7)+ 
+  geom_point(shape = 21, size=2, 
+             position = position_jitterdodge(), 
+             color="black", alpha=1)+
+  theme_bw() +theme(panel.grid = element_blank(),  axis.text.x = element_text(size = 13),
+                    ,  axis.text.y = element_text(size = 13))+
+  ylab(expression("Z-score for state7")) +
+  xlab("")  +
+  annotate(geom="text", cex=3,
+           x=1.5, y=3.5, 
+           label=paste0("P ", "= ",p),
+           color="black") + 
+  theme(axis.ticks = element_line(size=0.2,color="black"),
+        axis.ticks.length = unit(0.2,"cm"),
+        legend.position = "none",
+        axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10))
+dev.off()
+
+
+
